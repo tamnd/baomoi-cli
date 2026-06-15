@@ -6,10 +6,6 @@ import (
 	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in baomoi_test.go.
-
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
 	if info.Scheme != "baomoi" {
@@ -19,58 +15,77 @@ func TestDomainInfo(t *testing.T) {
 		t.Errorf("Hosts = %v, want [%s]", info.Hosts, Host)
 	}
 	if info.Identity.Binary != "baomoi" {
-		t.Errorf("Identity.Binary = %q, want baomoi", info.Identity.Binary)
+		t.Errorf("Binary = %q, want baomoi", info.Identity.Binary)
 	}
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in      string
+		wantTyp string
+		wantID  string
+		wantErr bool
+	}{
+		{"https://baomoi.com/c/some-article-slug.epi", "article", "some-article-slug", false},
+		{"/c/another-slug.epi", "article", "another-slug", false},
+		{"thoi-su", "category", "thoi-su", false},
+		{"kinh-te", "category", "kinh-te", false},
+		{"", "", "", true},
+		{"not-a-category-or-url", "", "", true},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("Classify(%q): want error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Classify(%q): %v", tc.in, err)
+			continue
+		}
+		if typ != tc.wantTyp || id != tc.wantID {
+			t.Errorf("Classify(%q) = (%q,%q), want (%q,%q)", tc.in, typ, id, tc.wantTyp, tc.wantID)
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	cases := []struct {
+		typ, id, want string
+		wantErr       bool
+	}{
+		{"article", "some-slug", "https://baomoi.com/c/some-slug.epi", false},
+		{"category", "thoi-su", "https://baomoi.com/thoi-su/", false},
+		{"unknown", "x", "", true},
+	}
+	for _, tc := range cases {
+		got, err := Domain{}.Locate(tc.typ, tc.id)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("Locate(%q,%q): want error", tc.typ, tc.id)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("Locate(%q,%q) = (%q,%v), want (%q,nil)", tc.typ, tc.id, got, err, tc.want)
+		}
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	a := &Article{ID: "some-article-slug", URL: "https://baomoi.com/c/some-article-slug.epi", Category: "thoi-su"}
+	u, err := h.Mint(a)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "baomoi://page/wiki/Go"; u.String() != want {
+	if want := "baomoi://article/some-article-slug"; u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("baomoi", "about")
-	if err != nil || got.String() != "baomoi://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want baomoi://page/about", got.String(), err)
 	}
 }

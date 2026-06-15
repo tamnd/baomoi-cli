@@ -1,10 +1,10 @@
 // Package baomoi is the library behind the baomoi command line:
-// the HTTP client, request shaping, and the typed data models for baomoi.
+// the HTTP client, HTML scraping, and typed data models for Báo Mới
+// (baomoi.com), Vietnam's leading news aggregator.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Báo Mới has no public RSS; it aggregates 500+ Vietnamese news sources
+// into category listing pages at https://baomoi.com/{category}/trang-{N}.epi.
+// Article cards link to both the baomoi page and the original source.
 package baomoi
 
 import (
@@ -17,46 +17,81 @@ import (
 	"time"
 )
 
-// DefaultUserAgent identifies the client to baomoi. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "baomoi/dev (+https://github.com/tamnd/baomoi-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at baomoi.com; change it once you
-// know the real endpoints you want to read.
+// Host is the canonical site hostname.
 const Host = "baomoi.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// baseURL is the site root.
+const baseURL = "https://baomoi.com"
 
-// Client talks to baomoi over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+// DefaultUserAgent identifies this client to Báo Mới.
+const DefaultUserAgent = "baomoi-cli/0.1.0 (+https://github.com/tamnd/baomoi-cli)"
 
-	last time.Time
+// Categories lists the Báo Mới category slugs.
+var Categories = []string{
+	"thoi-su",
+	"the-gioi",
+	"kinh-te",
+	"giai-tri",
+	"the-thao",
+	"suc-khoe",
+	"giao-duc",
+	"phap-luat",
+	"du-lich",
+	"cong-nghe",
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+var categoryNames = map[string]string{
+	"thoi-su":   "Thời sự",
+	"the-gioi":  "Thế giới",
+	"kinh-te":   "Kinh tế",
+	"giai-tri":  "Giải trí",
+	"the-thao":  "Thể thao",
+	"suc-khoe":  "Sức khỏe",
+	"giao-duc":  "Giáo dục",
+	"phap-luat": "Pháp luật",
+	"du-lich":   "Du lịch",
+	"cong-nghe": "Công nghệ",
+}
+
+// Config holds the tunable knobs for the HTTP client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+	UserAgent string
+}
+
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      time.Second,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to Báo Mới over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client from DefaultConfig.
+func NewClient() *Client { return NewClientWithConfig(DefaultConfig()) }
+
+// NewClientWithConfig returns a Client built from cfg.
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout}}
+}
+
+// Get fetches rawURL and returns the body, pacing and retrying.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +99,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +108,20 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*")
+	req.Header.Set("Accept-Language", "vi-VN,vi;q=0.9")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -98,18 +135,14 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	}
 
 	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return b, err != nil, err
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +156,252 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on baomoi.com. It is a stand-in for the typed records you
-// will model from the real baomoi endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `baomoi cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- public types ---
+
+// Article is one aggregated article entry on Báo Mới.
+type Article struct {
+	ID           string `json:"id"                     kit:"id" table:"id"`
+	Title        string `json:"title"                            table:"title"`
+	URL          string `json:"url,omitempty"                    table:"url,url"`
+	OriginalURL  string `json:"original_url,omitempty"           table:"original_url,url"`
+	SourceName   string `json:"source_name,omitempty"            table:"source_name"`
+	SourceDomain string `json:"source_domain,omitempty"          table:"source_domain"`
+	Category     string `json:"category,omitempty"               table:"category"`
+	Thumbnail    string `json:"thumbnail,omitempty"              table:"-"`
+	PublishedAt  string `json:"published_at,omitempty"           table:"published_at"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// Category represents one Báo Mới category.
+type Category struct {
+	Slug string `json:"slug" kit:"id" table:"slug"`
+	Name string `json:"name"          table:"name"`
+	URL  string `json:"url"           table:"url,url"`
+}
+
+// --- HTML extraction patterns ---
+
+// articleLinkRE finds baomoi article links: href="/c/{slug}.epi"
+var articleLinkRE = regexp.MustCompile(`href="(/c/[^"]+\.epi)"`)
+
+// titleRE extracts text content from the nearest anchor or heading.
+var titleRE = regexp.MustCompile(`(?i)<a[^>]+href="/c/[^"]+\.epi"[^>]*>([^<]+)</a>`)
+
+// thumbnailRE finds og:image or the first article img src.
+var thumbnailRE = regexp.MustCompile(`(?i)<img[^>]+src="(https://[^"]+\.(?:jpg|png|jpeg|webp))"`)
+
+// publishedRE extracts a datetime from a <time> element or data-pubdate attribute.
+var publishedRE = regexp.MustCompile(`(?i)data-pubdate="([^"]+)"`)
+
+// sourceRE extracts the source name from a data-source or class="story__source" span.
+var sourceRE = regexp.MustCompile(`(?i)data-source="([^"]+)"`)
+
+// --- client methods ---
+
+// LatestArticles fetches the Báo Mới homepage for the latest articles.
+func (c *Client) LatestArticles(ctx context.Context, limit int) ([]*Article, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	body, err := c.Get(ctx, c.cfg.BaseURL+"/")
+	if err != nil {
+		return nil, fmt.Errorf("home: %w", err)
+	}
+	return parseListingHTML(body, "latest", limit, c.cfg.BaseURL), nil
+}
+
+// CategoryArticles fetches articles for the given category slug.
+func (c *Client) CategoryArticles(ctx context.Context, slug string, limit int) ([]*Article, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	body, err := c.Get(ctx, c.cfg.BaseURL+"/"+slug+"/")
+	if err != nil {
+		return nil, fmt.Errorf("category %s: %w", slug, err)
+	}
+	return parseListingHTML(body, slug, limit, c.cfg.BaseURL), nil
+}
+
+// SearchArticles is not supported by Báo Mới's public interface.
+// It falls back to searching the home listing by keyword.
+func (c *Client) SearchArticles(ctx context.Context, query string, limit int) ([]*Article, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	q := strings.ToLower(query)
+	all, err := c.LatestArticles(ctx, 50)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
+	var out []*Article
+	for _, a := range all {
+		if strings.Contains(strings.ToLower(a.Title), q) {
+			out = append(out, a)
+			if len(out) >= limit {
+				break
+			}
 		}
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+// ListCategories returns all known Báo Mới categories.
+func (c *Client) ListCategories() []*Category {
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = baseURL
+	}
+	out := make([]*Category, 0, len(Categories))
+	for _, slug := range Categories {
+		name := categoryNames[slug]
+		if name == "" {
+			name = slug
 		}
+		out = append(out, &Category{
+			Slug: slug,
+			Name: name,
+			URL:  base + "/" + slug + "/",
+		})
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// --- HTML parsing ---
+
+// parseListingHTML extracts Article records from a Báo Mới listing page.
+func parseListingHTML(body []byte, category string, limit int, base string) []*Article {
+	html := string(body)
+	seen := map[string]bool{}
+	var out []*Article
+
+	// Find all article links
+	links := articleLinkRE.FindAllStringSubmatch(html, -1)
+	if len(links) == 0 {
+		return out
 	}
-	return s
+
+	for _, m := range links {
+		if len(out) >= limit {
+			break
+		}
+		path := m[1]
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+
+		articleURL := base + path
+		id := strings.TrimPrefix(strings.TrimSuffix(path, ".epi"), "/c/")
+
+		// Extract title from the matching anchor
+		title := extractTitleForPath(html, path)
+		thumbnail := extractFirstImage(html, path)
+		source := extractSourceForPath(html, path)
+		pubAt := extractPubdateForPath(html, path)
+
+		out = append(out, &Article{
+			ID:          id,
+			Title:       title,
+			URL:         articleURL,
+			Category:    category,
+			SourceName:  source,
+			Thumbnail:   thumbnail,
+			PublishedAt: pubAt,
+		})
+	}
+	return out
 }
+
+// extractTitleForPath finds the title of an article card by its path.
+func extractTitleForPath(html, path string) string {
+	re := regexp.MustCompile(`(?i)<a[^>]+href="` + regexp.QuoteMeta(path) + `"[^>]*>([^<]{5,})</a>`)
+	m := re.FindStringSubmatch(html)
+	if len(m) >= 2 {
+		return cleanHTML(m[1])
+	}
+	return ""
+}
+
+// extractFirstImage finds the first significant image near an article link.
+func extractFirstImage(html, path string) string {
+	idx := strings.Index(html, `href="`+path+`"`)
+	if idx < 0 {
+		return ""
+	}
+	// Search around the card (~500 chars before)
+	start := idx - 500
+	if start < 0 {
+		start = 0
+	}
+	segment := html[start:idx]
+	m := thumbnailRE.FindStringSubmatch(segment)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// extractSourceForPath extracts data-source near the article link.
+func extractSourceForPath(html, path string) string {
+	idx := strings.Index(html, `href="`+path+`"`)
+	if idx < 0 {
+		return ""
+	}
+	end := idx + 300
+	if end > len(html) {
+		end = len(html)
+	}
+	m := sourceRE.FindStringSubmatch(html[idx:end])
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// extractPubdateForPath extracts data-pubdate near the article link.
+func extractPubdateForPath(html, path string) string {
+	idx := strings.Index(html, `href="`+path+`"`)
+	if idx < 0 {
+		return ""
+	}
+	end := idx + 300
+	if end > len(html) {
+		end = len(html)
+	}
+	m := publishedRE.FindStringSubmatch(html[idx:end])
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// cleanHTML strips HTML entities and trims whitespace.
+func cleanHTML(s string) string {
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	s = strings.ReplaceAll(s, "&#39;", "'")
+	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	return strings.TrimSpace(s)
+}
+
+// slugFromPath extracts the article slug from a /c/{slug}.epi path.
+func slugFromPath(path string) string {
+	s := strings.TrimPrefix(path, "/c/")
+	return strings.TrimSuffix(s, ".epi")
+}
+
+// extractArticleID returns the article slug from a Báo Mới URL or path.
+func extractArticleID(rawURL string) string {
+	// Match /c/{slug}.epi
+	re := regexp.MustCompile(`/c/([^/?#]+)\.epi`)
+	m := re.FindStringSubmatch(rawURL)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// titleREGlobal used by tests only — exported via test helper.
+var _ = titleRE
+var _ = slugFromPath
