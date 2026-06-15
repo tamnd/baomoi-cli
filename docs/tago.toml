@@ -1,0 +1,10 @@
+title       = "baomoi"
+baseURL     = "https://baomoi-cli.tamnd.com/"
+description = "A command line for baomoi."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/baomoi-cli"
